@@ -31,7 +31,7 @@ func initRedis() {
 	fmt.Printf("🛢️  Successfully connected to Redis!")
 }
 
-func RateLimiter(limit int, window time.Duration) gin.HandlerFunc {
+func FixedWindowCounter(limit int, window time.Duration) gin.HandlerFunc {
 	rateLimitScript := redis.NewScript(`
 		local current = redis.call("INCR", KEYS[1])
 		if current == 1 then
@@ -76,10 +76,66 @@ func RateLimiter(limit int, window time.Duration) gin.HandlerFunc {
 	}
 }
 
+func SlidingWindowLimiter(limit int, window time.Duration) gin.HandlerFunc {
+	slidingWindowScript := redis.NewScript(`
+		local key = KEYS[1]
+		local now = tonumber(ARGV[1])
+		local cutoff = tonumber(ARGV[2])
+		local limit = tonumber(ARGV[3])
+
+		redis.call('ZREMRANGEBYSCORE', key, 0, cutoff)
+
+		local current_requests = redis.call('ZCARD', key)
+
+		if current_requests >= limit then
+			return 0
+		end
+
+		redis.call('ZADD', key, now, now)
+		local ttl = math.ceil((now - cutoff) / 1000)
+		redis.call('EXPIRE', key, ttl)
+
+		return 1
+	`)
+
+	return func(c *gin.Context) {
+		clientIP := c.ClientIP()
+		key := fmt.Sprintf("sliding_limit:%s", clientIP)
+		ctx := c.Request.Context()
+
+		// Calculate the timestamps in Milliseconds
+		now := time.Now().UnixMilli()
+		cutoff := now - window.Milliseconds()
+
+		// Execute the script
+		// KEYS: [key]
+		// ARGV: [now, cutoff, limit]
+		result, err := slidingWindowScript.Run(ctx, rdb, []string{key}, now, cutoff, limit).Result()
+
+		if err != nil {
+			log.Println("Redis Lua script error:", err)
+			c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"error": "Internal Server Error"})
+			return
+		}
+
+		// The script returns 1 for success, 0 for rejected
+		allowed := result.(int64)
+
+		if allowed == 0 {
+			c.AbortWithStatusJSON(http.StatusTooManyRequests, gin.H{
+				"error": "🛑 Sliding window limit exceeded! Please slow down.",
+			})
+			return
+		}
+
+		c.Next()
+	}
+}
+
 func main() {
 	initRedis()
 	r := gin.Default()
-	r.Use(RateLimiter(5, 1*time.Minute))
+	r.Use(SlidingWindowLimiter(5, 1*time.Second))
 
 	r.GET("/api/data", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{
