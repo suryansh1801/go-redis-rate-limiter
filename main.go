@@ -32,6 +32,14 @@ func initRedis() {
 }
 
 func RateLimiter(limit int, window time.Duration) gin.HandlerFunc {
+	rateLimitScript := redis.NewScript(`
+		local current = redis.call("INCR", KEYS[1])
+		if current == 1 then
+			redis.call("EXPIRE", KEYS[1], ARGV[1])
+		end
+		return current
+	`)
+
 	return func(c *gin.Context) {
 		clientIP := c.ClientIP()
 
@@ -41,18 +49,16 @@ func RateLimiter(limit int, window time.Duration) gin.HandlerFunc {
 		// Using request's context to talk to Redis
 		ctx := c.Request.Context()
 
-		// INC increment the counter in redis
-		count, err := rdb.Incr(ctx, key).Result()
+		// INC increment the counter in redis through Lua script
+		result, err := rateLimitScript.Run(ctx, rdb, []string{key}, int(window.Seconds())).Result()
+
 		if err != nil {
-			log.Println("Redis error:", err)
+			log.Println("Redis Lua script error:", err)
 			c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"error": "Internal Server Error"})
 			return
 		}
 
-		// If this is their very first request, set the expiration timer (the "Window")
-		if count == 1 {
-			rdb.Expire(ctx, key, window)
-		}
+		count := result.(int64)
 
 		if count > int64(limit) {
 			c.AbortWithStatusJSON(http.StatusTooManyRequests, gin.H{
